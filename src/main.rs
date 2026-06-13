@@ -43,6 +43,7 @@ struct Config {
     threads: usize,
     max_connections: usize,
     idle_timeout_secs: u64,
+    stats_every_chunks: usize,
 }
 
 #[derive(Clone)]
@@ -81,6 +82,12 @@ enum VadEvent {
     Error {
         message: String,
     },
+    Stats {
+        chunks: usize,
+        avg_chunk_ms: f64,
+        p95_chunk_ms: f64,
+        max_chunk_ms: f64,
+    },
 }
 
 struct VadStream {
@@ -115,6 +122,7 @@ fn parse_args() -> Result<Config> {
         threads: 1,
         max_connections: 8,
         idle_timeout_secs: 60,
+        stats_every_chunks: 100,
     };
 
     let mut args = env::args().skip(1);
@@ -163,6 +171,12 @@ fn parse_args() -> Result<Config> {
                     .context("--idle-timeout-secs requires a value")?
                     .parse()?
             }
+            "--stats-every-chunks" => {
+                config.stats_every_chunks = args
+                    .next()
+                    .context("--stats-every-chunks requires a value")?
+                    .parse()?
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -206,6 +220,7 @@ Options:\n\
   --threads <n>               ONNX Runtime threads, default 1\n\
   --max-connections <n>       WebSocket connection cap, default 8\n\
   --idle-timeout-secs <n>     Close idle sockets, default 60\n\
+  --stats-every-chunks <n>    Send processing stats every n chunks, default 100\n\
 \n\
 WebSocket:\n\
   GET /vad\n\
@@ -435,6 +450,8 @@ async fn run_socket(socket: WebSocket, state: AppState) -> Result<()> {
     let (mut sender, mut receiver) = socket.split();
     let mut vad = VadStream::new(&state.config);
     let idle_timeout = Duration::from_secs(state.config.idle_timeout_secs);
+    let mut chunk_count = 0_usize;
+    let mut chunk_times = Vec::with_capacity(state.config.stats_every_chunks.max(1));
 
     send_event(
         &mut sender,
@@ -459,11 +476,20 @@ async fn run_socket(socket: WebSocket, state: AppState) -> Result<()> {
 
         match message {
             Message::Binary(payload) => {
+                let chunk_started = Instant::now();
                 let event = {
                     let mut session = state.session.lock().await;
                     vad.handle_pcm_chunk(&mut session, &payload)?
                 };
+                chunk_count += 1;
+                chunk_times.push(chunk_started.elapsed().as_secs_f64() * 1000.0);
                 if let Some(event) = event {
+                    send_event(&mut sender, &event).await?;
+                }
+                if state.config.stats_every_chunks > 0
+                    && chunk_times.len() >= state.config.stats_every_chunks
+                {
+                    let event = stats_event(chunk_count, &mut chunk_times);
                     send_event(&mut sender, &event).await?;
                 }
             }
@@ -483,6 +509,22 @@ async fn run_socket(socket: WebSocket, state: AppState) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn stats_event(chunks: usize, chunk_times: &mut Vec<f64>) -> VadEvent {
+    chunk_times.sort_by(|left, right| left.total_cmp(right));
+    let avg_chunk_ms = chunk_times.iter().sum::<f64>() / chunk_times.len() as f64;
+    let p95_index = ((chunk_times.len() - 1) as f64 * 0.95).round() as usize;
+    let p95_chunk_ms = chunk_times[p95_index.min(chunk_times.len() - 1)];
+    let max_chunk_ms = chunk_times.last().copied().unwrap_or(0.0);
+    chunk_times.clear();
+
+    VadEvent::Stats {
+        chunks,
+        avg_chunk_ms,
+        p95_chunk_ms,
+        max_chunk_ms,
+    }
 }
 
 async fn send_event(
