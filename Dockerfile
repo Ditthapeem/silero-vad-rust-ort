@@ -32,6 +32,6 @@ CMD rust-ort-vad \
     --sample-rate 16000 \
     --threads 1 \
     --max-connections 3 \
-    --threshold 0.45 \
+    --threshold 0.35 \
     --min-silence-ms 50 \
     --speech-pad-ms 10

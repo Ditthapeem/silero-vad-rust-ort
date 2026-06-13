@@ -1,10 +1,13 @@
 import argparse
 import asyncio
 import json
+import math
 import queue
+import shutil
 import statistics
 import sys
 import time
+from array import array
 from dataclasses import dataclass
 
 import sounddevice as sd
@@ -33,6 +36,8 @@ def blank_status():
         "last_probability": None,
         "last_latency_ms": None,
         "last_message": "",
+        "audio_rms": 0.0,
+        "audio_peak": 0.0,
     }
 
 
@@ -54,6 +59,18 @@ def pcm_callback(audio_queue: queue.Queue, status):
     return callback
 
 
+def audio_level(chunk):
+    samples = array("h")
+    samples.frombytes(chunk)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    if not samples:
+        return 0.0, 0.0
+    peak = max(abs(sample) for sample in samples) / 32768.0
+    rms = math.sqrt(sum(sample * sample for sample in samples) / len(samples)) / 32768.0
+    return rms, peak
+
+
 def percentile(values, fraction):
     if not values:
         return 0.0
@@ -67,7 +84,7 @@ def fmt_ms(value):
 
 
 def write_status_line(text):
-    width = 150
+    width = max(80, shutil.get_terminal_size((120, 20)).columns - 1)
     sys.stdout.write("\r" + text[:width].ljust(width))
     sys.stdout.flush()
 
@@ -154,21 +171,19 @@ async def reporter(latencies, counters, sent_counter, dropped_status, status, st
         last_sent = sent
         last_time = now
 
-        if latencies:
-            avg = statistics.fmean(latencies)
-            p95 = percentile(latencies, 0.95)
-            worst = max(latencies)
-            latency_text = (
-                f"lat avg={fmt_ms(avg)} p95={fmt_ms(p95)} max={fmt_ms(worst)}"
-            )
+        recent_latencies = latencies[-100:]
+        if recent_latencies:
+            avg = statistics.fmean(recent_latencies)
+            p95 = percentile(recent_latencies, 0.95)
+            worst = max(recent_latencies)
         else:
             avg = p95 = worst = None
 
         last_latency = status["last_latency_ms"]
-        last_latency_text = fmt_ms(last_latency) if last_latency is not None else "waiting"
-        avg_text = fmt_ms(avg) if avg is not None else "waiting"
-        p95_text = fmt_ms(p95) if p95 is not None else "waiting"
-        max_text = fmt_ms(worst) if worst is not None else "waiting"
+        last_latency_text = f"{last_latency:5.0f}" if last_latency is not None else "wait"
+        avg_text = f"{avg:5.0f}" if avg is not None else "wait"
+        p95_text = f"{p95:5.0f}" if p95 is not None else "wait"
+        max_text = f"{worst:5.0f}" if worst is not None else "wait"
         probability = status["last_probability"]
         probability_text = f"{probability:.3f}" if probability is not None else "-"
         audio_text = (
@@ -178,13 +193,12 @@ async def reporter(latencies, counters, sent_counter, dropped_status, status, st
         )
 
         line = (
-            f"[{now - started:8.2f}s] SPEED "
-            f"state={status['state']:<8} event={status['last_event']:<12} "
-            f"audio={audio_text:<8} prob={probability_text:<5} "
-            f"last={last_latency_text} avg={avg_text} p95={p95_text} max={max_text} "
-            f"send={current_rate:5.1f}/s total={total_rate:5.1f}/s "
-            f"dropped_audio={dropped_status['dropped']} "
-            f"events={counters}"
+            f"{now - started:6.1f}s "
+            f"{status['state']:<7} {status['last_event']:<12} "
+            f"prob={probability_text:<5} audio={audio_text:<7} "
+            f"e2e last/avg/p95/max={last_latency_text}/{avg_text}/{p95_text}/{max_text}ms "
+            f"mic rms/peak={status['audio_rms']:.3f}/{status['audio_peak']:.3f} "
+            f"send={current_rate:4.1f}/s drop={dropped_status['dropped']}"
         )
         write_status_line(line)
 
@@ -247,6 +261,7 @@ async def run(args):
                     print(f"\n[warn] got {len(chunk)} bytes, expected {CHUNK_BYTES}")
                     continue
 
+                status["audio_rms"], status["audio_peak"] = audio_level(chunk)
                 await ws.send(chunk)
                 sent_counter["value"] += 1
                 audio_end_ms = sent_counter["value"] * 32
