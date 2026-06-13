@@ -143,6 +143,10 @@ async def receiver(ws, pending, latencies, counters, status, started, verbose):
             status["state"] = "speech"
         elif event_type == "speech_end":
             status["state"] = "silence"
+        elif event_type == "heartbeat":
+            status["last_message"] = (
+                f"active_connections={event.get('active_connections')}"
+            )
         elif event_type == "error":
             status["state"] = "error"
 

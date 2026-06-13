@@ -29,7 +29,7 @@ use tokio::{net::TcpListener, sync::Mutex, time::timeout};
 use tracing::{error, info, warn};
 
 const PCM_I16_BYTES_PER_SAMPLE: usize = 2;
-const SILENCE_HEARTBEAT_MS: u128 = 1500;
+const HEARTBEAT_INTERVAL_MS: u64 = 1500;
 
 #[derive(Clone)]
 struct Config {
@@ -79,9 +79,8 @@ enum VadEvent {
         audio_time_ms: i64,
         probability: f32,
     },
-    Silence {
-        audio_time_ms: i64,
-        probability: f32,
+    Heartbeat {
+        active_connections: usize,
     },
     Error {
         message: String,
@@ -320,16 +319,7 @@ impl VadStream {
         self.input = input;
 
         self.current_sample += self.block_size as i64;
-        Ok(self.vad_event(probability).or_else(|| {
-            if self.triggered {
-                None
-            } else {
-                Some(VadEvent::Silence {
-                    audio_time_ms: self.current_sample * 1000 / self.sample_rate,
-                    probability,
-                })
-            }
-        }))
+        Ok(self.vad_event(probability))
     }
 
     fn vad_event(&mut self, probability: f32) -> Option<VadEvent> {
@@ -449,8 +439,7 @@ async fn run_socket(socket: WebSocket, state: AppState) -> Result<()> {
     let (mut sender, mut receiver) = socket.split();
     let mut vad = VadStream::new(&state.config);
     let idle_timeout = Duration::from_secs(state.config.idle_timeout_secs);
-    let mut last_silence_sent_at: Option<Instant> = None;
-    let mut send_next_silence = true;
+    let mut heartbeat = tokio::time::interval(Duration::from_millis(HEARTBEAT_INTERVAL_MS));
 
     send_event(
         &mut sender,
@@ -463,14 +452,28 @@ async fn run_socket(socket: WebSocket, state: AppState) -> Result<()> {
     .await?;
 
     loop {
-        let message = match timeout(idle_timeout, receiver.next()).await {
-            Ok(Some(Ok(message))) => message,
-            Ok(Some(Err(error))) => bail!("websocket receive failed: {error}"),
-            Ok(None) => break,
-            Err(_) => bail!(
-                "idle timeout after {} seconds",
-                state.config.idle_timeout_secs
-            ),
+        let message = tokio::select! {
+            _ = heartbeat.tick() => {
+                send_event(
+                    &mut sender,
+                    &VadEvent::Heartbeat {
+                        active_connections: state.active_connections.load(Ordering::Relaxed),
+                    },
+                )
+                .await?;
+                continue;
+            }
+            message = timeout(idle_timeout, receiver.next()) => {
+                match message {
+                    Ok(Some(Ok(message))) => message,
+                    Ok(Some(Err(error))) => bail!("websocket receive failed: {error}"),
+                    Ok(None) => break,
+                    Err(_) => bail!(
+                        "idle timeout after {} seconds",
+                        state.config.idle_timeout_secs
+                    ),
+                }
+            }
         };
 
         match message {
@@ -480,31 +483,7 @@ async fn run_socket(socket: WebSocket, state: AppState) -> Result<()> {
                     vad.handle_pcm_chunk(&mut session, &payload)?
                 };
                 if let Some(event) = event {
-                    match event {
-                        VadEvent::Silence { .. } => {
-                            let should_send = send_next_silence
-                                || last_silence_sent_at
-                                    .map(|sent_at| {
-                                        sent_at.elapsed().as_millis() >= SILENCE_HEARTBEAT_MS
-                                    })
-                                    .unwrap_or(true);
-
-                            if should_send {
-                                send_event(&mut sender, &event).await?;
-                                last_silence_sent_at = Some(Instant::now());
-                                send_next_silence = false;
-                            }
-                        }
-                        VadEvent::SpeechStart { .. } => {
-                            send_event(&mut sender, &event).await?;
-                            send_next_silence = false;
-                        }
-                        VadEvent::SpeechEnd { .. } => {
-                            send_event(&mut sender, &event).await?;
-                            send_next_silence = true;
-                        }
-                        _ => send_event(&mut sender, &event).await?,
-                    }
+                    send_event(&mut sender, &event).await?;
                 }
             }
             Message::Ping(payload) => sender.send(Message::Pong(payload)).await?,
