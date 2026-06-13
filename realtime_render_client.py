@@ -24,6 +24,18 @@ class SentChunk:
     audio_end_ms: int
 
 
+def blank_status():
+    return {
+        "ready": False,
+        "state": "connecting",
+        "last_event": "-",
+        "last_audio_ms": None,
+        "last_probability": None,
+        "last_latency_ms": None,
+        "last_message": "",
+    }
+
+
 def list_devices() -> None:
     print(sd.query_devices())
 
@@ -54,19 +66,32 @@ def fmt_ms(value):
     return f"{value:7.2f} ms"
 
 
-async def receiver(ws, pending, latencies, counters, started):
+def write_status_line(text):
+    width = 150
+    sys.stdout.write("\r" + text[:width].ljust(width))
+    sys.stdout.flush()
+
+
+async def receiver(ws, pending, latencies, counters, status, started, verbose):
     async for message in ws:
         now = time.perf_counter()
         event = json.loads(message)
         event_type = event.get("type", "unknown")
 
         if event_type == "ready":
-            print(
-                f"[{now - started:8.2f}s] READY "
+            status["ready"] = True
+            status["state"] = "ready"
+            status["last_event"] = "ready"
+            status["last_message"] = (
                 f"sample_rate={event.get('sample_rate')} "
                 f"chunk_samples={event.get('chunk_samples')} "
                 f"format={event.get('format')}"
             )
+            if verbose:
+                print(
+                    f"\n[{now - started:8.2f}s] READY "
+                    f"{status['last_message']}"
+                )
             continue
 
         audio_time_ms = event.get("audio_time_ms")
@@ -89,6 +114,20 @@ async def receiver(ws, pending, latencies, counters, started):
                     pending.pop(key, None)
 
         counters[event_type] = counters.get(event_type, 0) + 1
+        status["last_event"] = event_type
+        status["last_audio_ms"] = audio_time_ms
+        status["last_probability"] = probability
+        status["last_latency_ms"] = latency_ms
+        status["last_message"] = event.get("message") or ""
+
+        if event_type == "silence":
+            status["state"] = "silence"
+        elif event_type == "speech_start":
+            status["state"] = "speech"
+        elif event_type == "speech_end":
+            status["state"] = "silence"
+        elif event_type == "error":
+            status["state"] = "error"
 
         parts = [f"[{now - started:8.2f}s]", event_type.upper()]
         if audio_time_ms is not None:
@@ -99,14 +138,15 @@ async def receiver(ws, pending, latencies, counters, started):
             parts.append(f"e2e={fmt_ms(latency_ms)}")
         if event_type == "error":
             parts.append(f"message={event.get('message')}")
-        print(" ".join(parts))
+        if verbose or event_type in {"speech_start", "speech_end", "error"}:
+            print("\n" + " ".join(parts))
 
 
-async def reporter(latencies, counters, sent_counter, dropped_status, started):
+async def reporter(latencies, counters, sent_counter, dropped_status, status, started, interval):
     last_sent = 0
     last_time = started
     while True:
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(interval)
         now = time.perf_counter()
         sent = sent_counter["value"]
         current_rate = (sent - last_sent) / max(now - last_time, 1e-9)
@@ -122,16 +162,31 @@ async def reporter(latencies, counters, sent_counter, dropped_status, started):
                 f"lat avg={fmt_ms(avg)} p95={fmt_ms(p95)} max={fmt_ms(worst)}"
             )
         else:
-            latency_text = "lat avg=waiting p95=waiting max=waiting"
+            avg = p95 = worst = None
 
-        print(
+        last_latency = status["last_latency_ms"]
+        last_latency_text = fmt_ms(last_latency) if last_latency is not None else "waiting"
+        avg_text = fmt_ms(avg) if avg is not None else "waiting"
+        p95_text = fmt_ms(p95) if p95 is not None else "waiting"
+        max_text = fmt_ms(worst) if worst is not None else "waiting"
+        probability = status["last_probability"]
+        probability_text = f"{probability:.3f}" if probability is not None else "-"
+        audio_text = (
+            f"{status['last_audio_ms']}ms"
+            if status["last_audio_ms"] is not None
+            else "-"
+        )
+
+        line = (
             f"[{now - started:8.2f}s] SPEED "
-            f"sent={sent} current={current_rate:5.1f} chunks/s "
-            f"avg={total_rate:5.1f} chunks/s "
-            f"{latency_text} "
+            f"state={status['state']:<8} event={status['last_event']:<12} "
+            f"audio={audio_text:<8} prob={probability_text:<5} "
+            f"last={last_latency_text} avg={avg_text} p95={p95_text} max={max_text} "
+            f"send={current_rate:5.1f}/s total={total_rate:5.1f}/s "
             f"dropped_audio={dropped_status['dropped']} "
             f"events={counters}"
         )
+        write_status_line(line)
 
 
 async def run(args):
@@ -140,6 +195,7 @@ async def run(args):
     pending = {}
     latencies = []
     counters = {}
+    status = blank_status()
     sent_counter = {"value": 0}
     started = time.perf_counter()
 
@@ -165,9 +221,19 @@ async def run(args):
         ping_timeout=20,
         max_size=2**20,
     ) as ws:
-        recv_task = asyncio.create_task(receiver(ws, pending, latencies, counters, started))
+        recv_task = asyncio.create_task(
+            receiver(ws, pending, latencies, counters, status, started, args.verbose)
+        )
         report_task = asyncio.create_task(
-            reporter(latencies, counters, sent_counter, dropped_status, started)
+            reporter(
+                latencies,
+                counters,
+                sent_counter,
+                dropped_status,
+                status,
+                started,
+                args.refresh,
+            )
         )
 
         with stream:
@@ -178,7 +244,7 @@ async def run(args):
                     continue
 
                 if len(chunk) != CHUNK_BYTES:
-                    print(f"[warn] got {len(chunk)} bytes, expected {CHUNK_BYTES}")
+                    print(f"\n[warn] got {len(chunk)} bytes, expected {CHUNK_BYTES}")
                     continue
 
                 await ws.send(chunk)
@@ -193,6 +259,7 @@ async def run(args):
         report_task.cancel()
         await ws.close()
         await recv_task
+        print()
 
 
 def parse_args():
@@ -203,6 +270,8 @@ def parse_args():
     parser.add_argument("--device", default=None, help="Input device index or name")
     parser.add_argument("--seconds", type=float, default=0, help="Stop after N seconds")
     parser.add_argument("--queue-size", type=int, default=64)
+    parser.add_argument("--refresh", type=float, default=0.25, help="Status refresh seconds")
+    parser.add_argument("--verbose", action="store_true", help="Print every event")
     parser.add_argument("--list-devices", action="store_true")
     return parser.parse_args()
 
