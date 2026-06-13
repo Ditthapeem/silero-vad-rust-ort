@@ -7,7 +7,7 @@ RUN cargo build --release
 
 FROM debian:bookworm-slim AS runtime
 
-ARG ORT_VERSION=1.22.1
+ARG ORT_VERSION=1.22.0
 WORKDIR /app
 
 RUN apt-get update \
@@ -27,7 +27,7 @@ ENV RUST_LOG=rust_ort_vad=info
 CMD rust-ort-vad \
     --host 0.0.0.0 \
     --port "${PORT:-8080}" \
-    --ort-lib /opt/onnxruntime/lib/libonnxruntime.so.1.22.1 \
+    --ort-lib /opt/onnxruntime/lib/libonnxruntime.so.1.22.0 \
     --model models/silero_vad.onnx \
     --sample-rate 16000 \
     --threads 1 \
