@@ -29,6 +29,7 @@ use tokio::{net::TcpListener, sync::Mutex, time::timeout};
 use tracing::{error, info, warn};
 
 const PCM_I16_BYTES_PER_SAMPLE: usize = 2;
+const SILENCE_HEARTBEAT_MS: u128 = 1500;
 
 #[derive(Clone)]
 struct Config {
@@ -448,6 +449,8 @@ async fn run_socket(socket: WebSocket, state: AppState) -> Result<()> {
     let (mut sender, mut receiver) = socket.split();
     let mut vad = VadStream::new(&state.config);
     let idle_timeout = Duration::from_secs(state.config.idle_timeout_secs);
+    let mut last_silence_sent_at: Option<Instant> = None;
+    let mut send_next_silence = true;
 
     send_event(
         &mut sender,
@@ -477,7 +480,31 @@ async fn run_socket(socket: WebSocket, state: AppState) -> Result<()> {
                     vad.handle_pcm_chunk(&mut session, &payload)?
                 };
                 if let Some(event) = event {
-                    send_event(&mut sender, &event).await?;
+                    match event {
+                        VadEvent::Silence { .. } => {
+                            let should_send = send_next_silence
+                                || last_silence_sent_at
+                                    .map(|sent_at| {
+                                        sent_at.elapsed().as_millis() >= SILENCE_HEARTBEAT_MS
+                                    })
+                                    .unwrap_or(true);
+
+                            if should_send {
+                                send_event(&mut sender, &event).await?;
+                                last_silence_sent_at = Some(Instant::now());
+                                send_next_silence = false;
+                            }
+                        }
+                        VadEvent::SpeechStart { .. } => {
+                            send_event(&mut sender, &event).await?;
+                            send_next_silence = false;
+                        }
+                        VadEvent::SpeechEnd { .. } => {
+                            send_event(&mut sender, &event).await?;
+                            send_next_silence = true;
+                        }
+                        _ => send_event(&mut sender, &event).await?,
+                    }
                 }
             }
             Message::Ping(payload) => sender.send(Message::Pong(payload)).await?,
